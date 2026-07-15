@@ -157,6 +157,162 @@ app.post("/api/create-representative", async (req, res) => {
   }
 });
 
+// ── E-1: Sale Invoice Endpoint (atomic Firestore transaction) ──────────────
+app.post("/api/create-sale-invoice", async (req, res) => {
+  try {
+    const decoded = await verifyOwner(req);
+    if (!decoded) {
+      return res.status(401).json({ error: "Unauthorized — invalid or missing ID token" });
+    }
+
+    const { businessId, locationId, items, paidAmount, paymentMethod, partyId, partyName, dueDate, notes } = req.body;
+
+    if (!businessId || !locationId || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
+    for (const item of items) {
+      if (!item.productId || !item.productName || !item.quantity || !item.unitPrice) {
+        return res.status(400).json({ error: "Each item must have productId, productName, quantity, unitPrice" });
+      }
+    }
+
+    const now = new Date().toISOString();
+    const paid = Number(paidAmount) || 0;
+
+    const result = await db.runTransaction(async (tx) => {
+      // 1. Read stock docs and check availability
+      const stockData = [];
+      for (const item of items) {
+        const stockRef = db.collection("businesses").doc(businessId).collection("stock").doc(`${item.locationId ?? locationId}_${item.productId}`);
+        const stockSnap = await tx.get(stockRef);
+        if (!stockSnap.exists) {
+          throw new Error(`Stock not found for product ${item.productName}`);
+        }
+        const stockQty = stockSnap.data().quantity ?? 0;
+        if (stockQty < item.quantity) {
+          throw new Error(`Insufficient stock for ${item.productName}: available ${stockQty}, requested ${item.quantity}`);
+        }
+        // Read product cost price
+        const productRef = db.collection("businesses").doc(businessId).collection("products").doc(item.productId);
+        const productSnap = await tx.get(productRef);
+        const costPrice = productSnap.exists ? (productSnap.data().costPrice ?? 0) : 0;
+        stockData.push({ ref: stockRef, currentQty: stockQty, costPrice });
+      }
+
+      // 2. Compute totals
+      let subtotal = 0;
+      for (let i = 0; i < items.length; i++) {
+        const it = items[i];
+        subtotal += it.quantity * it.unitPrice - (it.discount ?? 0);
+      }
+      const discountTotal = Number(req.body.discountTotal) || 0;
+      const taxTotal = Number(req.body.taxTotal) || 0;
+      const returnTotal = Number(req.body.returnTotal) || 0;
+      const netTotal = subtotal - discountTotal + taxTotal - returnTotal;
+
+      // 3. Status
+      let status = "unpaid";
+      if (paid <= 0) status = "unpaid";
+      else if (paid >= netTotal) status = "paid";
+      else status = "partial";
+
+      // 4. Next invoice number
+      const invoicesRef = db.collection("businesses").doc(businessId).collection("invoices");
+      const numSnap = await tx.get(
+        invoicesRef.where("type", "==", "sale").orderBy("number", "desc").limit(1)
+      );
+      let nextNumber = 1;
+      if (!numSnap.empty) {
+        nextNumber = (numSnap.docs[0].data().number ?? 0) + 1;
+      }
+
+      // 5. Build invoice doc
+      const invoiceId = `inv_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+      const invoiceRef = invoicesRef.doc(invoiceId);
+      const embeddedItems = items.map((it, i) => ({
+        productId: it.productId,
+        productName: it.productName,
+        quantity: it.quantity,
+        unitPrice: it.unitPrice,
+        unitCost: stockData[i].costPrice,
+        discount: it.discount ?? 0,
+        total: it.quantity * it.unitPrice - (it.discount ?? 0),
+      }));
+
+      tx.set(invoiceRef, {
+        type: "sale",
+        number: nextNumber,
+        partyId: partyId ?? null,
+        partyName: partyName ?? null,
+        subtotal,
+        discountTotal,
+        taxTotal,
+        returnTotal,
+        netTotal,
+        paidAmount: paid,
+        status,
+        paymentMethod: paymentMethod ?? "cash",
+        dueDate: dueDate ?? null,
+        notes: notes ?? null,
+        locationId,
+        sellerId: decoded.uid ?? null,
+        sellerName: partyName ?? null,
+        items: embeddedItems,
+        createdAt: now,
+        syncedAt: now,
+        sourceDeviceId: "dashboard",
+      });
+
+      // 6. Decrement stock
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        const stockDocId = `${item.locationId ?? locationId}_${item.productId}`;
+        const stockRef = db.collection("businesses").doc(businessId).collection("stock").doc(stockDocId);
+        tx.update(stockRef, {
+          quantity: stockData[i].currentQty - item.quantity,
+          syncedAt: now,
+          sourceDeviceId: "dashboard",
+        });
+
+        // Also decrement global product quantity
+        const productRef = db.collection("businesses").doc(businessId).collection("products").doc(item.productId);
+        tx.update(productRef, {
+          quantity: admin.firestore.FieldValue.increment(-item.quantity),
+        });
+      }
+
+      // 7. Customer balance update (sale → unpaid remainder = debt)
+      if (partyId && (netTotal - paid) !== 0) {
+        const unpaidRemainder = netTotal - paid;
+        const custRef = db.collection("businesses").doc(businessId).collection("customers").doc(partyId);
+        tx.update(custRef, {
+          balance: admin.firestore.FieldValue.increment(unpaidRemainder),
+        });
+      }
+
+      // 8. Treasury transaction
+      if (paid > 0) {
+        const treasuryRef = db.collection("businesses").doc(businessId).collection("treasury").doc();
+        tx.set(treasuryRef, {
+          direction: "in",
+          amount: paid,
+          reason: `دفعة فاتورة بيع #${nextNumber}`,
+          relatedInvoiceId: invoiceId,
+          createdAt: now,
+          sourceDeviceId: "dashboard",
+        });
+      }
+
+      return { id: invoiceId, subtotal, netTotal, status };
+    });
+
+    res.json(result);
+  } catch (err) {
+    console.error("[create-sale-invoice] Error:", err);
+    res.status(500).json({ error: err.message || "Failed to create invoice" });
+  }
+});
+
 // ── Health ─────────────────────────────────────────────────────────────────
 app.get("/health", (_, res) => res.json({ status: "ok" }));
 app.get("/api/health", (_, res) => res.json({ status: "ok" }));
